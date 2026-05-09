@@ -1,22 +1,3 @@
-# ============================================================
-# FreeFrame — Production Docker Compose
-# ============================================================
-# Shared env block applied to all Python services (api, worker,
-# email_worker, beat) via YAML anchor. FreeFrame's Settings()
-# loads every config field at import time, so partial env blocks
-# fail validation regardless of which service runs.
-#
-# Host ports remapped to avoid Nextcloud AIO and CrowdSec:
-#   Traefik on 8081 (HTTP) / 8444 (HTTPS).
-#   MinIO API on 9100, MinIO console on 9101.
-#
-# IMPORTANT: S3_ENDPOINT is the in-network address used by api/
-# worker (http://minio:9000). S3_PUBLIC_ENDPOINT is what the
-# browser uses (e.g. http://192.168.0.101:9100). Presigned upload
-# URLs are signed with the public endpoint so the browser can
-# reach them.
-# ============================================================
-
 x-app-env: &app-env
   POSTGRES_USER: ${POSTGRES_USER}
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
