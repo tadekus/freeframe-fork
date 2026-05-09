@@ -1,14 +1,49 @@
 # ============================================================
 # FreeFrame — Production Docker Compose
 # ============================================================
-# Usage:
-#   cp .env.example .env.prod        # configure your settings
-#   docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
+# Shared env block applied to all Python services (api, worker,
+# email_worker, beat) via YAML anchor. FreeFrame's Settings()
+# loads every config field at import time, so partial env blocks
+# fail validation regardless of which service runs.
 #
-# SSL: Set DOMAIN and ACME_EMAIL in .env.prod for automatic
-#      Let's Encrypt certificates. Without a domain, it runs
-#      on HTTP only (port 80).
+# Host ports remapped to avoid Nextcloud AIO and CrowdSec:
+#   Traefik on 8081 (HTTP) / 8444 (HTTPS).
+#   MinIO API on 9100, MinIO console on 9101.
+#
+# IMPORTANT: S3_ENDPOINT is the in-network address used by api/
+# worker (http://minio:9000). S3_PUBLIC_ENDPOINT is what the
+# browser uses (e.g. http://192.168.0.101:9100). Presigned upload
+# URLs are signed with the public endpoint so the browser can
+# reach them.
 # ============================================================
+
+x-app-env: &app-env
+  POSTGRES_USER: ${POSTGRES_USER}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  POSTGRES_DB: ${POSTGRES_DB}
+  DATABASE_URL: ${DATABASE_URL}
+  REDIS_PASSWORD: ${REDIS_PASSWORD}
+  REDIS_URL: ${REDIS_URL}
+  S3_STORAGE: ${S3_STORAGE}
+  S3_BUCKET: ${S3_BUCKET}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+  S3_SECRET_KEY: ${S3_SECRET_KEY}
+  S3_REGION: ${S3_REGION}
+  S3_ENDPOINT: ${S3_ENDPOINT}
+  S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT}
+  JWT_SECRET: ${JWT_SECRET}
+  JWT_ALGORITHM: ${JWT_ALGORITHM}
+  ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES}
+  REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS}
+  FRONTEND_URL: ${FRONTEND_URL}
+  MAIL_PROVIDER: ${MAIL_PROVIDER}
+  MAIL_FROM_ADDRESS: ${MAIL_FROM_ADDRESS}
+  MAIL_FROM_NAME: ${MAIL_FROM_NAME}
+  SMTP_HOST: ${SMTP_HOST}
+  SMTP_PORT: ${SMTP_PORT}
+  SMTP_USER: ${SMTP_USER}
+  SMTP_PASSWORD: ${SMTP_PASSWORD}
+  SMTP_USE_TLS: ${SMTP_USE_TLS}
 
 services:
   traefik:
@@ -19,13 +54,12 @@ services:
       - --providers.docker.exposedbydefault=false
       - --entrypoints.web.address=:80
       - --entrypoints.websecure.address=:443
-      # Let's Encrypt automatic certificates (requires DOMAIN and ACME_EMAIL)
       - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:-}
       - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
       - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
     ports:
-      - "80:80"
-      - "443:443"
+      - "8081:80"
+      - "8444:443"
     volumes:
       - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
       - letsencrypt:/letsencrypt
@@ -33,8 +67,10 @@ services:
 
   postgres:
     image: postgres:15-alpine
-    env_file:
-      - .env.prod
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -52,8 +88,8 @@ services:
       else
         redis-server --appendonly yes;
       fi"
-    env_file:
-      - .env.prod
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
     volumes:
       - redisdata:/data
     healthcheck:
@@ -63,18 +99,58 @@ services:
       retries: 5
     restart: unless-stopped
 
+  minio:
+    image: minio/minio:RELEASE.2024-09-13T20-26-02Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
+    ports:
+      - "9100:9000"
+      - "9101:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:RELEASE.2024-09-16T17-43-14Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_BUCKET: ${S3_BUCKET}
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 $$S3_ACCESS_KEY $$S3_SECRET_KEY; do
+        echo 'Waiting for MinIO...'; sleep 2;
+      done;
+      mc mb --ignore-existing local/$$S3_BUCKET;
+      mc anonymous set download local/$$S3_BUCKET || true;
+      echo 'MinIO bucket ready: '$$S3_BUCKET;
+      "
+    restart: "no"
+
   api:
     build:
       context: .
       dockerfile: apps/api/Dockerfile.prod
-    env_file:
-      - .env.prod
     environment:
-      - DISABLE_DOCS=true
+      <<: *app-env
+      DISABLE_DOCS: "true"
+      API_WORKERS: ${API_WORKERS:-4}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     command: >
       sh -c "cd /workspace/apps/api && alembic upgrade head && cd /workspace &&
@@ -92,17 +168,14 @@ services:
       retries: 3
     labels:
       - traefik.enable=true
-      # HTTP router (always active)
       - traefik.http.routers.api.rule=PathPrefix(`/api`)
       - traefik.http.routers.api.entrypoints=web
       - traefik.http.routers.api.middlewares=strip-api-prefix
-      # HTTPS router (active when SSL is configured)
       - traefik.http.routers.api-secure.rule=PathPrefix(`/api`)
       - traefik.http.routers.api-secure.entrypoints=websecure
       - traefik.http.routers.api-secure.tls.certresolver=letsencrypt
       - traefik.http.routers.api-secure.middlewares=strip-api-prefix
       - traefik.http.routers.api-secure.service=api
-      # Shared
       - traefik.http.middlewares.strip-api-prefix.stripprefix.prefixes=/api
       - traefik.http.services.api.loadbalancer.server.port=8000
     restart: unless-stopped
@@ -111,12 +184,15 @@ services:
     build:
       context: .
       dockerfile: apps/api/Dockerfile.prod
-    env_file:
-      - .env.prod
+    environment:
+      <<: *app-env
+      TRANSCODING_CONCURRENCY: ${TRANSCODING_CONCURRENCY:-2}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     command: sh -c "celery -A apps.api.tasks.celery_app worker -Q transcoding -c $${TRANSCODING_CONCURRENCY:-2} --loglevel=warning"
     restart: unless-stopped
@@ -125,8 +201,9 @@ services:
     build:
       context: .
       dockerfile: apps/api/Dockerfile.prod
-    env_file:
-      - .env.prod
+    environment:
+      <<: *app-env
+      EMAIL_CONCURRENCY: ${EMAIL_CONCURRENCY:-2}
     depends_on:
       redis:
         condition: service_healthy
@@ -137,8 +214,8 @@ services:
     build:
       context: .
       dockerfile: apps/api/Dockerfile.prod
-    env_file:
-      - .env.prod
+    environment:
+      <<: *app-env
     depends_on:
       redis:
         condition: service_healthy
@@ -151,8 +228,8 @@ services:
       dockerfile: Dockerfile.prod
       args:
         NEXT_PUBLIC_API_URL: /api
-    env_file:
-      - .env.prod
+    environment:
+      FRONTEND_URL: ${FRONTEND_URL}
     depends_on:
       - api
     healthcheck:
@@ -163,11 +240,9 @@ services:
       retries: 3
     labels:
       - traefik.enable=true
-      # HTTP router (always active)
       - traefik.http.routers.web.rule=PathPrefix(`/`)
       - traefik.http.routers.web.entrypoints=web
       - traefik.http.routers.web.priority=1
-      # HTTPS router (active when SSL is configured)
       - traefik.http.routers.web-secure.rule=PathPrefix(`/`)
       - traefik.http.routers.web-secure.entrypoints=websecure
       - traefik.http.routers.web-secure.tls.certresolver=letsencrypt
@@ -179,4 +254,5 @@ services:
 volumes:
   pgdata:
   redisdata:
+  miniodata:
   letsencrypt:
